@@ -1,0 +1,45 @@
+name: Master RMS Daily Batch
+
+# 1. The Trigger: When should this run?
+on:
+  schedule:
+    # This cron syntax means: "Run at 18:30 UTC every single day"
+    # 18:30 UTC is exactly Midnight (00:00) Indian Standard Time (IST)
+    - cron: '30 21 * * *' 
+    
+  # This allows you to go to the GitHub Actions tab and click a "Run workflow" button to test it manually!
+  workflow_dispatch: 
+
+permissions:
+  contents: read
+
+jobs:
+  run-billing-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Step 1: Get the code from your repository
+    - uses: actions/checkout@v4
+    
+    # Step 2: Set up the Python environment
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        
+    # Step 3: Install ONLY the libraries your script actually needs
+    - name: Install Data Engineering Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas numpy sqlalchemy pymysql cryptography
+        
+    # Step 4: Run the script and securely inject your Aiven Database Secrets
+    - name: Execute Master Pipeline
+      env:
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_PORT: ${{ secrets.DB_PORT }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+      run: |
+        python master_daily_batch.py
