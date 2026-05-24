@@ -33,4 +33,4 @@ jobs:
           POSTGRES_API_URL: ${{ secrets.POSTGRES_API_URL }}
           MYSQL_MASTER_URL: ${{ secrets.MYSQL_MASTER_URL }}
         run: |
-          python batch_recharge.py
+          python recharge_server.py
