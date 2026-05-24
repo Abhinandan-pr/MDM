@@ -53,8 +53,7 @@ def process_single_recharge():
         mysql_trans.execute(
             text("""
                 UPDATE consumer_master 
-                SET CURRENT_BALANCE_INR = CURRENT_BALANCE_INR + :amt,
-                    last_recharge_date = NOW()
+                SET CURRENT_BALANCE_INR = CURRENT_BALANCE_INR + :amt
                 WHERE consumer_no = :c_no;
             """),
             {"amt": amount, "c_no": consumer_no}
