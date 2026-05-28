@@ -16,8 +16,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [HES EDGE] - %(mes
 app = Flask(__name__)
 DB_FILE = "hes_edge_node.db"
 
-# ⚠️ Set this in your Render Environment Variables!
-MDM_BULK_WEBHOOK_URL = os.getenv("MDM_BULK_WEBHOOK_URL", "https://mdm-ou39.onrender.com/api/v1/callbacks/hes-status-bulk")
+# Pointing perfectly to your live Render MDM Bulk Receiver
+MDM_BULK_WEBHOOK_URL = os.getenv("MDM_BULK_WEBHOOK_URL", "https://mdm-ou39.onrender.com/api/v1/callbacks/hes-status/bulk")
 
 def get_db():
     conn = sqlite3.connect(DB_FILE)
@@ -26,9 +26,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # -------------------------------------------------------------
-        # 1. LIVE RC-DC ZONE (UNTOUCHED SCHEMA)
-        # -------------------------------------------------------------
+        # 1. LIVE RC-DC ZONE
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_commands (
                 hes_tx_id TEXT PRIMARY KEY,
@@ -41,9 +39,7 @@ def init_db():
             )
         """)
         
-        # -------------------------------------------------------------
-        # 2. PROVISIONING, STATE, AND MONTHLY SETTLEMENT ZONE
-        # -------------------------------------------------------------
+        # 2. PROVISIONING & STATE ZONE
         conn.execute("""
             CREATE TABLE IF NOT EXISTS hes_provisioned_meters (
                 meter_no TEXT PRIMARY KEY,
@@ -86,33 +82,45 @@ def init_db():
 
 init_db()
 
-# =====================================================================
-# HEALTH CHECK
-# =====================================================================
 @app.route('/', methods=['GET'])
 def health_check():
-    return "HES Edge Node is Live and Optimized for 1000-record micro-batches.", 200
+    return "HES Edge Node is Live and Optimized for Bulk Operations.", 200
 
 # =====================================================================
 # PART 1: LIVE RC-DC PIPELINE (ASYNC & BULK)
 # =====================================================================
-@app.route('/api/v1/commands/relay-state', methods=['POST'])
-def receive_command():
-    """Receives RC-DC from MDM and queues it instantly (202 Accepted)."""
-    data = request.json
-    hes_tx_id = f"HES_TX_{uuid.uuid4().hex[:8].upper()}"
+
+# 🆕 NEW: BULK RECEIVER (MDM -> HES)
+@app.route('/api/v1/commands/relay-state/bulk', methods=['POST'])
+def receive_commands_bulk():
+    """Receives an array of up to 5,000 commands from the MDM at once."""
+    commands = request.json.get('commands', [])
+    
+    if not commands:
+        return jsonify({"error": "No commands provided."}), 400
+    if len(commands) > 5000:
+        return jsonify({"error": "Batch size too large. Max 5000."}), 413
+
+    insert_data = []
+    for cmd in commands:
+        hes_tx_id = f"HES_TX_{uuid.uuid4().hex[:8].upper()}"
+        insert_data.append((hes_tx_id, cmd['reference_id'], cmd['meter_no'], cmd['command']))
     
     with get_db() as conn:
-        conn.execute("INSERT INTO pending_commands (hes_tx_id, reference_id, meter_no, command) VALUES (?, ?, ?, ?)", 
-                     (hes_tx_id, data['reference_id'], data['meter_no'], data['command']))
+        conn.executemany("""
+            INSERT INTO pending_commands (hes_tx_id, reference_id, meter_no, command) 
+            VALUES (?, ?, ?, ?)
+        """, insert_data)
         conn.commit()
-    return jsonify({"status": "QUEUED", "hes_transaction_id": hes_tx_id}), 202
+        
+    logging.info(f"📥 Received and Queued {len(insert_data)} Bulk Commands.")
+    return jsonify({"status": "QUEUED", "count": len(insert_data)}), 202
 
 @app.route('/internal/process-queue', methods=['GET'])
 def process_queue():
     """Worker 1: Simulates RF network execution (Runs every 2 mins)"""
     with get_db() as conn:
-        commands = conn.execute("SELECT * FROM pending_commands WHERE status = 'PENDING' LIMIT 50").fetchall()
+        commands = conn.execute("SELECT * FROM pending_commands WHERE status = 'PENDING' LIMIT 1000").fetchall()
         
     if not commands:
         return jsonify({"message": "RC-DC Queue empty."}), 200
@@ -120,22 +128,34 @@ def process_queue():
     processed = 0
     with get_db() as update_conn:
         for row in commands:
-            time.sleep(0.1) # Simulate RF delay
+            # Simulate ultra-fast RF execution for load testing
             update_conn.execute("UPDATE pending_commands SET status = 'COMPLETED' WHERE hes_tx_id = ?", (row['hes_tx_id'],))
             
-            # Auto-sync the local edge state based on the command
+            # Auto-sync the local edge state
             new_status = 'D' if row['command'] == 'DISCONNECT' else 'C'
             update_conn.execute("UPDATE consumer_edge_state SET connection_status = ? WHERE meter_no = ?", (new_status, row['meter_no']))
             processed += 1
         update_conn.commit()
             
-    return jsonify({"message": f"Processed {processed} RC-DC commands."}), 200
+    return jsonify({"message": f"Processed {processed} RC-DC commands over RF."}), 200
 
+# 🆕 UPDATED: BULK CALLBACK SENDER (HES -> MDM)
 @app.route('/internal/push-bulk-callbacks', methods=['GET'])
 def push_bulk_callbacks():
-    """Worker 2: Pushes async responses back to MDM (STRICT 1000 BATCH LIMIT)"""
+    """Worker 2: Pushes async responses back to MDM."""
+    return execute_bulk_push()
+
+# 🆕 NEW: MANUAL RETRY ENDPOINT
+@app.route('/internal/retry-failed-callbacks', methods=['GET'])
+def retry_failed_callbacks():
+    """Manually triggers a re-push of any callbacks that the MDM previously rejected or missed."""
+    logging.info("♻️ Initiating Manual Retry for Unsent Callbacks...")
+    return execute_bulk_push()
+
+def execute_bulk_push():
+    """Core logic for sending webhooks securely."""
     with get_db() as conn:
-        # Strictly limited to 1000 to minimize server load
+        # Grab completed commands that have NOT been successfully acknowledged by the MDM
         unsent = conn.execute("""
             SELECT hes_tx_id, reference_id, meter_no, command 
             FROM pending_commands 
@@ -144,33 +164,46 @@ def push_bulk_callbacks():
         """).fetchall()
 
     if not unsent:
-        return jsonify({"message": "No pending callbacks."}), 200
+        return jsonify({"message": "No pending or failed callbacks to push."}), 200
 
+    # Formatted specifically for your new MDM Bulk Receiver ('results' array)
     bulk_payload = {
-        "batch_size": len(unsent),
-        "data": [{"hes_transaction_id": r['hes_tx_id'], "reference_id": r['reference_id'], "meter_no": r['meter_no'], "command": r['command'], "status": "SUCCESS"} for r in unsent]
+        "results": [{
+            "hes_transaction_id": r['hes_tx_id'], 
+            "reference_id": r['reference_id'], 
+            "meter_no": r['meter_no'], 
+            "command": r['command'], 
+            "status": "SUCCESS"
+        } for r in unsent]
     }
 
     try:
+        logging.info(f"🚀 Pushing payload of {len(unsent)} callbacks to MDM...")
         resp = requests.post(MDM_BULK_WEBHOOK_URL, json=bulk_payload, timeout=20)
+        
         if resp.status_code == 200:
+            # ONLY mark as notified if the MDM returned a 200 OK
             tx_ids = [r['hes_tx_id'] for r in unsent]
             placeholders = ','.join(['?'] * len(tx_ids))
             with get_db() as conn:
                 conn.execute(f"UPDATE pending_commands SET is_notified = 1 WHERE hes_tx_id IN ({placeholders})", tx_ids)
                 conn.commit()
+            
+            logging.info("✅ MDM successfully acknowledged the bulk payload.")
             return jsonify({"message": f"Successfully pushed {len(unsent)} callbacks to MDM."}), 200
-        return jsonify({"error": f"MDM rejected payload (Status {resp.status_code})"}), 502
+        else:
+            logging.error(f"🚨 MDM Rejected Payload (Status {resp.status_code}): {resp.text}")
+            return jsonify({"error": f"MDM rejected payload (Status {resp.status_code})"}), 502
+            
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": "Network failure reaching MDM"}), 503
-
+        logging.error(f"🚨 Network Error reaching MDM: {e}")
+        return jsonify({"error": "Network failure reaching MDM. Will retry later."}), 503
 
 # =====================================================================
-# PART 2: THE GENERATION WORKER (Runs once daily at midnight)
+# PART 2: THE GENERATION WORKER (Midnight Block Load)
 # =====================================================================
 @app.route('/internal/worker/generate-reads', methods=['GET'])
 def generate_daily_reads():
-    """Worker 3: Autonomous Data Generator (Respects DC status & Net Metering)"""
     target_date = datetime.now().date()
     target_date_str = target_date.strftime("%Y-%m-%d")
     
@@ -184,7 +217,6 @@ def generate_daily_reads():
         for c in consumers:
             m_no = c['meter_no']
             
-            # 1. Disconnected meters do not consume power
             if c['connection_status'] == 'D':
                 imp_inc, exp_inc = 0.0, 0.0
             else:
@@ -197,7 +229,6 @@ def generate_daily_reads():
             tz2 = round(c['curr_import_tz2'] + (imp_inc * 0.4), 2)
             tz3 = round(c['curr_import_tz3'] + (imp_inc * 0.2), 2)
 
-            # 2. Update state, pushing current values back into previous values
             conn.execute("""
                 UPDATE consumer_edge_state 
                 SET prev_import_total = curr_import_total, 
@@ -207,7 +238,6 @@ def generate_daily_reads():
                 WHERE meter_no=?
             """, (new_imp, tz1, tz2, tz3, new_exp, target_date_str, m_no))
 
-            # 3. Monthly Settlement Engine
             if is_month_start:
                 conn.execute("""
                     UPDATE hes_monthly_settlement 
@@ -220,7 +250,6 @@ def generate_daily_reads():
                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
                 """, (m_no, curr_month_str, new_imp, new_exp))
 
-        # 4. Clean up old settlement data to save DB space
         if is_month_start:
             two_months_ago = (target_date - relativedelta(months=2)).strftime("%Y-%m")
             conn.execute("DELETE FROM hes_monthly_settlement WHERE billing_month <= ?", (two_months_ago,))
@@ -228,13 +257,11 @@ def generate_daily_reads():
         conn.commit()
     return jsonify({"message": f"Successfully generated reads for {len(consumers)} meters."}), 200
 
-
 # =====================================================================
-# PART 3: MASTER DATA SYNC & EXPORT APIs (MDM <-> HES)
+# PART 3: MASTER DATA SYNC & EXPORT APIs
 # =====================================================================
 @app.route('/api/v1/sync/meters-bulk', methods=['POST'])
 def sync_meters_bulk():
-    """MDM pushes bulk consumer data to the HES (Max 5000 per push)."""
     meters = request.json.get('meters', [])
     if not meters: return jsonify({"error": "No meters provided."}), 400
     if len(meters) > 5000: return jsonify({"error": "Batch size too large."}), 413
@@ -266,36 +293,14 @@ def sync_meters_bulk():
 
 @app.route('/api/v1/export/daily-reads', methods=['GET'])
 def export_daily():
-    """MDM pulls the generated daily reads (STRICT 1000 BATCH LIMIT)."""
     limit = int(request.args.get('limit', 1000))
     offset = int(request.args.get('offset', 0))
-    
-    # 🛑 Hard Cap at 1000
-    if limit > 1000: 
-        return jsonify({"error": "PAYLOAD_TOO_LARGE", "message": "Max batch size is 1000 for server stability."}), 413
+    if limit > 1000: return jsonify({"error": "PAYLOAD_TOO_LARGE", "message": "Max batch size is 1000."}), 413
     
     with get_db() as conn:
         data = [dict(r) for r in conn.execute("SELECT * FROM consumer_edge_state LIMIT ? OFFSET ?", (limit, offset)).fetchall()]
     return jsonify({"count": len(data), "limit": limit, "offset": offset, "data": data}), 200
 
-@app.route('/api/v1/export/monthly-settlement', methods=['GET'])
-def export_monthly():
-    """MDM pulls the monthly True-Up billing profile (STRICT 1000 BATCH LIMIT)."""
-    month = request.args.get('billing_month')
-    limit = int(request.args.get('limit', 1000))
-    offset = int(request.args.get('offset', 0))
-    
-    # 🛑 Hard Cap at 1000
-    if limit > 1000: 
-        return jsonify({"error": "PAYLOAD_TOO_LARGE", "message": "Max batch size is 1000 for server stability."}), 413
-        
-    with get_db() as conn:
-        data = [dict(r) for r in conn.execute("SELECT * FROM hes_monthly_settlement WHERE billing_month=? LIMIT ? OFFSET ?", (month, limit, offset)).fetchall()]
-    return jsonify({"billing_month": month, "count": len(data), "limit": limit, "offset": offset, "data": data}), 200
-
-# =====================================================================
-# SERVER START
-# =====================================================================
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
