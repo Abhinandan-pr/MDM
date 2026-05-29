@@ -6,3 +6,4 @@ requests==2.31.0
 gunicorn==21.2.0
 SQLAlchemy>=2.0.30
 python-dateutil
+requests
