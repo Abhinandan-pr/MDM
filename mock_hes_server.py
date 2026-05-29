@@ -25,13 +25,10 @@ if not POSTGRES_API_URL:
     logging.critical("🚨 POSTGRES_API_URL is missing!")
     exit(1)
 
-# High-performance connection pool for bulk operations
 pg_engine = create_engine(POSTGRES_API_URL, pool_size=10, max_overflow=20)
 
 def init_db():
-    """Creates AMISP-1 strictly isolated tables in the shared Postgres DB."""
     with pg_engine.begin() as conn:
-        # 1. LIVE RC-DC ZONE (Isolated)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS amisp1_pending_commands (
                 hes_tx_id VARCHAR(50) PRIMARY KEY,
@@ -43,27 +40,21 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
-        # 2. PROVISIONING & STATE ZONE (Isolated)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS amisp1_consumer_edge_state (
                 meter_no VARCHAR(50) PRIMARY KEY,
                 consumer_type VARCHAR(20) DEFAULT 'NORMAL',
                 connection_status VARCHAR(5) DEFAULT 'C',
-                
                 curr_import_total REAL DEFAULT 0.0,
                 prev_import_total REAL DEFAULT 0.0,
                 curr_import_tz1 REAL DEFAULT 0.0,
                 curr_import_tz2 REAL DEFAULT 0.0,
                 curr_import_tz3 REAL DEFAULT 0.0,
-                
                 curr_export_total REAL DEFAULT 0.0,
                 prev_export_total REAL DEFAULT 0.0,
-                
                 last_read_date DATE
             )
         """))
-        
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS amisp1_monthly_settlement (
                 meter_no VARCHAR(50),
@@ -88,11 +79,9 @@ def health_check():
 # =====================================================================
 @app.route('/api/v1/commands/relay-state/bulk', methods=['POST'])
 def receive_commands_bulk():
-    """Receives commands and inserts them to PostgreSQL in chunks of 1000."""
     commands = request.json.get('commands', [])
     if not commands: return jsonify({"error": "No commands provided."}), 400
 
-    # Ensure we only process AMISP-1 commands just in case MDM routed poorly
     insert_data = []
     for cmd in commands:
         hes_tx_id = f"HES_TX_{uuid.uuid4().hex[:8].upper()}"
@@ -113,9 +102,10 @@ def receive_commands_bulk():
     logging.info(f"📥 Queued {len(insert_data)} Bulk Commands in Postgres.")
     return jsonify({"status": "QUEUED", "count": len(insert_data)}), 202
 
+
 @app.route('/internal/process-queue', methods=['GET'])
 def process_queue():
-    """Worker 1: Simulates RF network execution (Bulk Updates)"""
+    """Worker 1: Simulates RF network execution (Lightning Fast Update)"""
     with pg_engine.connect() as conn:
         commands = conn.execute(text("""
             SELECT hes_tx_id, meter_no, command 
@@ -126,20 +116,42 @@ def process_queue():
     if not commands:
         return jsonify({"message": "RC-DC Queue empty."}), 200
 
-    # Prepare batch data
-    update_tx = [{"hes_tx": r['hes_tx_id']} for r in commands]
-    update_state = [{"new_stat": 'D' if r['command'] == 'DISCONNECT' else 'C', "m_no": r['meter_no']} for r in commands]
+    # ⚡ OPTIMIZATION: Extract arrays to run exactly 3 queries instead of 2000
+    all_tx_ids = [r['hes_tx_id'] for r in commands]
+    meters_to_disconnect = [r['meter_no'] for r in commands if r['command'] == 'DISCONNECT']
+    meters_to_reconnect = [r['meter_no'] for r in commands if r['command'] == 'RECONNECT']
 
-    # Execute in a single transaction block
     with pg_engine.begin() as conn:
-        conn.execute(text("UPDATE amisp1_pending_commands SET status = 'COMPLETED' WHERE hes_tx_id = :hes_tx"), update_tx)
-        conn.execute(text("UPDATE amisp1_consumer_edge_state SET connection_status = :new_stat WHERE meter_no = :m_no"), update_state)
+        # 1. Update tracking log in one shot
+        tx_list_str = "', '".join(all_tx_ids)
+        conn.execute(text(f"UPDATE amisp1_pending_commands SET status = 'COMPLETED' WHERE hes_tx_id IN ('{tx_list_str}')"))
+        
+        # 2. Update physical state for Disconnects in one shot
+        if meters_to_disconnect:
+            dc_list_str = "', '".join(meters_to_disconnect)
+            conn.execute(text(f"UPDATE amisp1_consumer_edge_state SET connection_status = 'D' WHERE meter_no IN ('{dc_list_str}')"))
             
+        # 3. Update physical state for Reconnects in one shot
+        if meters_to_reconnect:
+            rc_list_str = "', '".join(meters_to_reconnect)
+            conn.execute(text(f"UPDATE amisp1_consumer_edge_state SET connection_status = 'C' WHERE meter_no IN ('{rc_list_str}')"))
+            
+    logging.info(f"⚡ Processed {len(commands)} RC-DC physical commands instantly.")
     return jsonify({"message": f"Processed {len(commands)} RC-DC commands over RF."}), 200
+
 
 @app.route('/internal/push-bulk-callbacks', methods=['GET'])
 def push_bulk_callbacks():
     """Worker 2: Pushes async responses back to MDM."""
+    return execute_bulk_push()
+
+@app.route('/internal/retry-failed-callbacks', methods=['GET'])
+def retry_failed_callbacks():
+    """Manual trigger to re-push callbacks that MDM missed."""
+    logging.info("♻️ Initiating Manual Retry for Unsent Callbacks...")
+    return execute_bulk_push()
+
+def execute_bulk_push():
     with pg_engine.connect() as conn:
         unsent = conn.execute(text("""
             SELECT hes_tx_id, reference_id, meter_no, command 
@@ -161,13 +173,20 @@ def push_bulk_callbacks():
     try:
         resp = requests.post(MDM_BULK_WEBHOOK_URL, json=bulk_payload, timeout=20)
         if resp.status_code == 200:
-            update_data = [{"hes_tx": r['hes_tx_id']} for r in unsent]
+            # ⚡ OPTIMIZATION: Update Notification status in one shot
+            tx_ids = [r['hes_tx_id'] for r in unsent]
+            tx_list_str = "', '".join(tx_ids)
+            
             with pg_engine.begin() as conn:
-                conn.execute(text("UPDATE amisp1_pending_commands SET is_notified = TRUE WHERE hes_tx_id = :hes_tx"), update_data)
+                conn.execute(text(f"UPDATE amisp1_pending_commands SET is_notified = TRUE WHERE hes_tx_id IN ('{tx_list_str}')"))
+                
+            logging.info(f"✅ Successfully pushed {len(unsent)} callbacks to MDM.")
             return jsonify({"message": f"Successfully pushed {len(unsent)} callbacks to MDM."}), 200
         else:
+            logging.error(f"❌ MDM rejected payload (Status {resp.status_code})")
             return jsonify({"error": f"MDM rejected payload (Status {resp.status_code})"}), 502
     except requests.exceptions.RequestException as e:
+        logging.error(f"🚨 Network failure reaching MDM: {e}")
         return jsonify({"error": "Network failure reaching MDM."}), 503
 
 # =====================================================================
@@ -221,13 +240,10 @@ def generate_daily_reads():
 # =====================================================================
 @app.route('/api/v1/sync/meters-bulk', methods=['POST'])
 def sync_meters_bulk():
-    """MDM pushes bulk consumer data. Strictly filters for AMISP-1."""
     meters = request.json.get('meters', [])
     if not meters: return jsonify({"error": "No meters provided."}), 400
 
-    # 🛑 THE GATEKEEPER: Only accept meters explicitly marked for this AMISP
     valid_meters = [m for m in meters if m.get('amisp_name') == TARGET_AMISP]
-    
     if not valid_meters:
         return jsonify({"message": f"Ignored payload. No {TARGET_AMISP} meters found."}), 200
 
@@ -240,7 +256,6 @@ def sync_meters_bulk():
             "stat": m.get('connection_status', 'C'), "imp": b_imp, "exp": b_exp
         })
 
-    # Bulk Insert in Chunks (Postgres Syntax for UPSERT)
     CHUNK_SIZE = 1000
     with pg_engine.begin() as conn:
         for i in range(0, len(state_data), CHUNK_SIZE):
