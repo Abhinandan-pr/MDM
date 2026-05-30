@@ -20,6 +20,7 @@ TARGET_AMISP = "AMISP-1"
 
 POSTGRES_API_URL = os.getenv("POSTGRES_API_URL")
 MDM_BULK_WEBHOOK_URL = os.getenv("MDM_BULK_WEBHOOK_URL", "https://mdm-ou39.onrender.com/api/v1/callbacks/hes-status/bulk")
+MDM_PRIORITY_RC_WEBHOOK_URL = os.getenv("MDM_PRIORITY_RC_WEBHOOK_URL", "https://mdm-ou39.onrender.com/api/v1/callbacks/hes-status/rc-priority")
 
 if not POSTGRES_API_URL:
     logging.critical("🚨 POSTGRES_API_URL is missing!")
@@ -139,29 +140,34 @@ def process_queue():
     logging.info(f"⚡ Processed {len(commands)} RC-DC physical commands instantly.")
     return jsonify({"message": f"Processed {len(commands)} RC-DC commands over RF."}), 200
 
-
 @app.route('/internal/push-bulk-callbacks', methods=['GET'])
 def push_bulk_callbacks():
-    """Worker 2: Pushes async responses back to MDM."""
-    return execute_bulk_push()
+    """Worker 2: Pushes async responses back to MDM via Dual-Lanes."""
+    rc_response = push_lane_to_mdm("RECONNECT", MDM_PRIORITY_RC_WEBHOOK_URL)
+    dc_response = push_lane_to_mdm("DISCONNECT", MDM_BULK_DC_WEBHOOK_URL)
+    
+    return jsonify({
+        "priority_rc_status": rc_response,
+        "bulk_dc_status": dc_response
+    }), 200
 
 @app.route('/internal/retry-failed-callbacks', methods=['GET'])
 def retry_failed_callbacks():
-    """Manual trigger to re-push callbacks that MDM missed."""
     logging.info("♻️ Initiating Manual Retry for Unsent Callbacks...")
-    return execute_bulk_push()
+    return push_bulk_callbacks()
 
-def execute_bulk_push():
+def push_lane_to_mdm(command_type, target_url):
+    """Generic pusher that filters by command type (RC vs DC)"""
     with pg_engine.connect() as conn:
-        unsent = conn.execute(text("""
+        unsent = conn.execute(text(f"""
             SELECT hes_tx_id, reference_id, meter_no, command 
             FROM amisp1_pending_commands 
-            WHERE status = 'COMPLETED' AND is_notified = FALSE 
+            WHERE status = 'COMPLETED' AND is_notified = FALSE AND command = '{command_type}'
             LIMIT 1000
         """)).mappings().fetchall()
 
     if not unsent:
-        return jsonify({"message": "No pending callbacks."}), 200
+        return f"No {command_type}s pending."
 
     bulk_payload = {
         "results": [{
@@ -171,24 +177,25 @@ def execute_bulk_push():
     }
 
     try:
-        resp = requests.post(MDM_BULK_WEBHOOK_URL, json=bulk_payload, timeout=20)
+        logging.info(f"🚀 Pushing {len(unsent)} {command_type}s to {target_url}...")
+        resp = requests.post(target_url, json=bulk_payload, timeout=30)
+        
         if resp.status_code == 200:
-            # ⚡ OPTIMIZATION: Update Notification status in one shot
             tx_ids = [r['hes_tx_id'] for r in unsent]
             tx_list_str = "', '".join(tx_ids)
             
             with pg_engine.begin() as conn:
                 conn.execute(text(f"UPDATE amisp1_pending_commands SET is_notified = TRUE WHERE hes_tx_id IN ('{tx_list_str}')"))
                 
-            logging.info(f"✅ Successfully pushed {len(unsent)} callbacks to MDM.")
-            return jsonify({"message": f"Successfully pushed {len(unsent)} callbacks to MDM."}), 200
+            logging.info(f"✅ {command_type} Lane: Success.")
+            return f"Pushed {len(unsent)} records."
         else:
-            logging.error(f"❌ MDM rejected payload (Status {resp.status_code})")
-            return jsonify({"error": f"MDM rejected payload (Status {resp.status_code})"}), 502
+            logging.error(f"❌ MDM rejected {command_type} payload: {resp.text}")
+            return f"MDM Rejected (HTTP {resp.status_code})"
+            
     except requests.exceptions.RequestException as e:
-        logging.error(f"🚨 Network failure reaching MDM: {e}")
-        return jsonify({"error": "Network failure reaching MDM."}), 503
-
+        logging.error(f"🚨 Network failure on {command_type} Lane: {e}")
+        return f"Network Failure: {str(e)}"
 # =====================================================================
 # PART 2: THE GENERATION WORKER (Midnight Block Load)
 # =====================================================================
