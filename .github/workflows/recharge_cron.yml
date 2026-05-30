@@ -25,7 +25,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install sqlalchemy pymysql psycopg2-binary cryptography
+          pip install sqlalchemy pymysql psycopg2-binary cryptography requests
 
       - name: Execute Batch Recharge Script
         # This is where GitHub pulls your Repository Secrets and injects them
