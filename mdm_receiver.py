@@ -2,6 +2,7 @@ import os
 import uuid
 import requests
 import logging
+import threading
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
 
@@ -32,16 +33,12 @@ def health_check():
     return "MDM Unified Server is awake and listening!", 200
 
 # =====================================================================
-# ENDPOINT 1: THE BULK CALLBACK RECEIVER (HES -> MDM)
+# BACKGROUND WORKER (For Bulk Processing)
 # =====================================================================
-@app.route('/api/v1/callbacks/hes-status/bulk', methods=['POST'])
-def hes_status_callback_bulk():
-    records = request.json.get('results', [])
-    if not records:
-        return jsonify({"error": "Empty or missing 'results' array"}), 400
-        
-    logging.info(f"📥 Received Bulk Callback containing {len(records)} meter updates.")
-
+def process_bulk_callback_in_background(records):
+    """This runs silently in the background after the MDM has already replied to the HES."""
+    logging.info(f"⚙️ BACKGROUND TASK: Processing {len(records)} meter updates...")
+    
     pg_updates = []
     dc_meters = []
     rc_meters = []
@@ -80,8 +77,7 @@ def hes_status_callback_bulk():
                     pg_updates
                 )
         except Exception as e:
-            logging.error(f"🚨 PostgreSQL Bulk Update Failed: {e}")
-            return jsonify({"error": "Failed to update tracking log"}), 500
+            logging.error(f"🚨 Background PostgreSQL Bulk Update Failed: {e}")
 
     # 3. LIGHTNING FAST Bulk Update MySQL (Master Data State)
     if dc_meters or rc_meters:
@@ -97,12 +93,77 @@ def hes_status_callback_bulk():
                     rc_str = "', '".join(rc_meters)
                     mysql_conn.execute(text(f"UPDATE consumer_master SET connection_status = 'C' WHERE meter_no IN ('{rc_str}')"))
                     
-            logging.info(f"✅ MySQL Master Updated: {len(dc_meters)} Disconnected, {len(rc_meters)} Reconnected.")
+            logging.info(f"✅ BACKGROUND SUCCESS: MySQL Master Updated: {len(dc_meters)} DC, {len(rc_meters)} RC.")
         except Exception as e:
-            logging.error(f"🚨 MySQL Bulk Update Failed: {e}")
-            return jsonify({"error": "Failed to update master table"}), 500
+            logging.error(f"🚨 Background MySQL Bulk Update Failed: {e}")
 
-    return jsonify({"message": f"Successfully processed {len(records)} callbacks."}), 200
+
+# =====================================================================
+# ENDPOINT 1: THE BULK CALLBACK RECEIVER (HES -> MDM)
+# =====================================================================
+@app.route('/api/v1/callbacks/hes-status/bulk', methods=['POST'])
+def hes_status_callback_bulk():
+    records = request.json.get('results', [])
+    if not records:
+        return jsonify({"error": "Empty or missing 'results' array"}), 400
+        
+    logging.info(f"📥 Received Bulk Callback payload for {len(records)} meters.")
+
+    # 1. FIRE AND FORGET
+    # We pass the records to the background worker and let it run independently
+    thread = threading.Thread(target=process_bulk_callback_in_background, args=(records,))
+    thread.start()
+
+    # 2. INSTANT HTTP REPLY
+    # The HES gets this instantly and hangs up the phone, completely avoiding timeouts.
+    return jsonify({
+        "message": "Payload accepted for background processing.",
+        "queued_count": len(records)
+    }), 202
+
+
+# =====================================================================
+# ENDPOINT 1.5: THE PRIORITY VIP LANE (RC CALLBACKS ONLY)
+# =====================================================================
+@app.route('/api/v1/callbacks/hes-status/rc-priority', methods=['POST'])
+def hes_status_callback_rc_priority():
+    records = request.json.get('results', [])
+    if not records:
+        return jsonify({"error": "Empty payload"}), 400
+        
+    logging.info(f"⚡ PRIORITY LANE: Received {len(records)} RECONNECT callbacks.")
+
+    pg_updates = []
+    rc_meters = []
+
+    for data in records:
+        if data.get('status') == "SUCCESS" and data.get('command') == 'RECONNECT':
+            pg_updates.append({
+                "status": "SUCCESS",
+                "hes_tx": data.get('hes_transaction_id'),
+                "cmd_id": data.get('reference_id')
+            })
+            rc_meters.append(data.get('meter_no'))
+
+    # 1. Update Tracking Log
+    if pg_updates:
+        with pg_engine.begin() as pg_conn:
+            pg_conn.execute(
+                text("""
+                    UPDATE dc_rc_log 
+                    SET status = :status, hes_transaction_id = :hes_tx, executed_at = NOW()
+                    WHERE command_id = :cmd_id
+                """), pg_updates
+            )
+
+    # 2. Lightning Fast Master Update
+    if rc_meters:
+        rc_str = "', '".join(rc_meters)
+        with mysql_engine.begin() as mysql_conn:
+            mysql_conn.execute(text(f"UPDATE consumer_master SET connection_status = 'C' WHERE meter_no IN ('{rc_str}')"))
+            
+    logging.info(f"🎉 VIP Reconnects Complete: {len(rc_meters)} meters restored instantly.")
+    return jsonify({"message": f"Priority RC Processed"}), 200
 
 
 # =====================================================================
@@ -177,49 +238,6 @@ def trigger_realtime_rc():
     except Exception as e:
         logging.error(f"🚨 Network error firing HES: {e}")
         return jsonify({"error": "Network failure reaching HES"}), 503
-
-# =====================================================================
-# ENDPOINT 1.5: THE PRIORITY VIP LANE (RC CALLBACKS ONLY)
-# =====================================================================
-@app.route('/api/v1/callbacks/hes-status/rc-priority', methods=['POST'])
-def hes_status_callback_rc_priority():
-    records = request.json.get('results', [])
-    if not records:
-        return jsonify({"error": "Empty payload"}), 400
-        
-    logging.info(f"⚡ PRIORITY LANE: Received {len(records)} RECONNECT callbacks.")
-
-    pg_updates = []
-    rc_meters = []
-
-    for data in records:
-        if data.get('status') == "SUCCESS" and data.get('command') == 'RECONNECT':
-            pg_updates.append({
-                "status": "SUCCESS",
-                "hes_tx": data.get('hes_transaction_id'),
-                "cmd_id": data.get('reference_id')
-            })
-            rc_meters.append(data.get('meter_no'))
-
-    # 1. Update Tracking Log
-    if pg_updates:
-        with pg_engine.begin() as pg_conn:
-            pg_conn.execute(
-                text("""
-                    UPDATE dc_rc_log 
-                    SET status = :status, hes_transaction_id = :hes_tx, executed_at = NOW()
-                    WHERE command_id = :cmd_id
-                """), pg_updates
-            )
-
-    # 2. Lightning Fast Master Update
-    if rc_meters:
-        rc_str = "', '".join(rc_meters)
-        with mysql_engine.begin() as mysql_conn:
-            mysql_conn.execute(text(f"UPDATE consumer_master SET connection_status = 'C' WHERE meter_no IN ('{rc_str}')"))
-            
-    logging.info(f"🎉 VIP Reconnects Complete: {len(rc_meters)} meters restored instantly.")
-    return jsonify({"message": f"Priority RC Processed"}), 200
 
 
 if __name__ == '__main__':
