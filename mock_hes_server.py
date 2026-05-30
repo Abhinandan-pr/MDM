@@ -144,7 +144,7 @@ def process_queue():
 def push_bulk_callbacks():
     """Worker 2: Pushes async responses back to MDM via Dual-Lanes."""
     rc_response = push_lane_to_mdm("RECONNECT", MDM_PRIORITY_RC_WEBHOOK_URL)
-    dc_response = push_lane_to_mdm("DISCONNECT", MDM_BULK_DC_WEBHOOK_URL)
+    dc_response = push_lane_to_mdm("DISCONNECT", MDM_BULK_WEBHOOK_URL)
     
     return jsonify({
         "priority_rc_status": rc_response,
