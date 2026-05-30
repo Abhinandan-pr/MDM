@@ -178,6 +178,50 @@ def trigger_realtime_rc():
         logging.error(f"🚨 Network error firing HES: {e}")
         return jsonify({"error": "Network failure reaching HES"}), 503
 
+# =====================================================================
+# ENDPOINT 1.5: THE PRIORITY VIP LANE (RC CALLBACKS ONLY)
+# =====================================================================
+@app.route('/api/v1/callbacks/hes-status/rc-priority', methods=['POST'])
+def hes_status_callback_rc_priority():
+    records = request.json.get('results', [])
+    if not records:
+        return jsonify({"error": "Empty payload"}), 400
+        
+    logging.info(f"⚡ PRIORITY LANE: Received {len(records)} RECONNECT callbacks.")
+
+    pg_updates = []
+    rc_meters = []
+
+    for data in records:
+        if data.get('status') == "SUCCESS" and data.get('command') == 'RECONNECT':
+            pg_updates.append({
+                "status": "SUCCESS",
+                "hes_tx": data.get('hes_transaction_id'),
+                "cmd_id": data.get('reference_id')
+            })
+            rc_meters.append(data.get('meter_no'))
+
+    # 1. Update Tracking Log
+    if pg_updates:
+        with pg_engine.begin() as pg_conn:
+            pg_conn.execute(
+                text("""
+                    UPDATE dc_rc_log 
+                    SET status = :status, hes_transaction_id = :hes_tx, executed_at = NOW()
+                    WHERE command_id = :cmd_id
+                """), pg_updates
+            )
+
+    # 2. Lightning Fast Master Update
+    if rc_meters:
+        rc_str = "', '".join(rc_meters)
+        with mysql_engine.begin() as mysql_conn:
+            mysql_conn.execute(text(f"UPDATE consumer_master SET connection_status = 'C' WHERE meter_no IN ('{rc_str}')"))
+            
+    logging.info(f"🎉 VIP Reconnects Complete: {len(rc_meters)} meters restored instantly.")
+    return jsonify({"message": f"Priority RC Processed"}), 200
+
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
