@@ -180,7 +180,7 @@ def push_lane_to_mdm(command_type, target_url):
         logging.info(f"🚀 Pushing {len(unsent)} {command_type}s to {target_url}...")
         resp = requests.post(target_url, json=bulk_payload, timeout=30)
         
-        if resp.status_code == 200:
+        if resp.status_code in [200, 202]:
             tx_ids = [r['hes_tx_id'] for r in unsent]
             tx_list_str = "', '".join(tx_ids)
             
