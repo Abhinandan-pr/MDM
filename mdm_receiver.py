@@ -22,7 +22,7 @@ if not POSTGRES_API_URL or not MYSQL_MASTER_URL:
     logging.critical("Database URLs missing! Ensure environment variables are set.")
     exit(1)
 
-pg_engine = create_engine(POSTGRES_API_URL, pool_size=10, max_overflow=20)
+pg_engine = create_engine(POSTGRES_API_URL, pool_size=10, max_overflow=20,max_overflow=20,pool_recycle=280)
 mysql_engine = create_engine(MYSQL_MASTER_URL, pool_size=10, max_overflow=20)
 
 session = requests.Session()
